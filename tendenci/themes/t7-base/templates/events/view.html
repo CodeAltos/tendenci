@@ -392,6 +392,9 @@ div.small-font {
           {% endif %}
         </h4>
         {% registration_pricing_and_button event request.user %}
+          {% if event.available_for_purchase %}
+             <a class="btn btn-success" href="{% url 'event.purchase_assets' event.id %}">{% trans "Purchase Recording & Materials Only" %}</a>
+          {% endif %}
       {% endif %}
       </div>
 
@@ -541,4 +544,9 @@ div.small-font {
   // });
   });
 </script>
+
+{% if event.is_public and not event.is_over %}
+{% render_json_ld event.structured_data %}
+{% endif %}
+
 {% endblock %}

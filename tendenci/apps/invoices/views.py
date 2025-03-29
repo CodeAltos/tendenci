@@ -203,14 +203,20 @@ def mark_as_paid(request, id, template_name='invoices/mark-as-paid.html'):
             action_taken = invoice.make_payment(payment.creator,
                                                 payment.amount)
             if action_taken:
+                obj = invoice.get_object()
                 if invoice.use_third_party_payment:
                     # it's a third party payment (external payment),
                     # approve this chapter membership if invoice is marked
                     # as paid.
-                    obj = invoice.get_object()
                     if obj and obj.__class__.__name__ == 'ChapterMembership':
                         if not obj.is_approved():
                             obj.approve(request_user=request.user)
+                if obj.__class__.__name__ == 'Registration':
+                    # send confirmation email to registrant
+                    if not obj.event.is_over:
+                        obj.send_registrant_notification()
+                elif obj.__class__.__name__ == 'AssetsPurchase':
+                    obj.auto_update_paid_object(request, payment)
                 
                 EventLog.objects.log(instance=invoice)
                 messages.add_message(
@@ -512,8 +518,11 @@ def search(request, template_name="invoices/search.html"):
         if all([search_criteria == 'owner__id',
                 search_method == 'exact',
                 owner]):
-            invoices = invoices.filter(Q(bill_to_email__iexact=owner.email)
+            if owner.email:
+                invoices = invoices.filter(Q(bill_to_email__iexact=owner.email)
                                | Q(owner_id=owner.id))
+            else:
+                invoices = invoices.filter(owner_id=owner.id)
         else:
             search_filter = {'%s%s' % (search_criteria,
                                        search_type): search_text}

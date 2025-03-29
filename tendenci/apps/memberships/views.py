@@ -69,13 +69,15 @@ from tendenci.apps.memberships.forms import (
     AutoRenewSetupForm,
     MessageForm,
     MemberSearchForm,
-    EmailMembersForm)
+    EmailMembersForm,
+    RegionForm)
 from tendenci.apps.memberships.utils import (prepare_chart_data,
     get_days, get_over_time_stats, iter_memberships,
     get_membership_stats, ImportMembDefault,
     get_membership_app, get_membership_summary_data,
     email_pending_members,
     email_membership_members)
+from tendenci.apps.regions.models import Region
 from tendenci.apps.base.forms import CaptchaForm
 from tendenci.apps.perms.decorators import is_enabled
 from tendenci.apps.theme.utils import get_template_content_raw
@@ -1145,6 +1147,14 @@ def membership_default_add(request, slug='', membership_id=None,
         membership = get_object_or_404(MembershipDefault, id=membership_id)
         if not (request.user.is_superuser or request.user == membership.user):
             raise Http403
+        # Check if they're an individual under a corp.
+        # If so, assign cm_id and join_under_corporate 
+        # so that we can check if this individual can be
+        # renewed or not.
+        if membership.corporate_membership_id and not cm_id:
+            cm_id = membership.corporate_membership_id
+            if not join_under_corporate:
+                join_under_corporate = True
         is_renewal = True
 
     membership_type_id = request.GET.get('membership_type_id', u'')
@@ -1215,14 +1225,25 @@ def membership_default_add(request, slug='', membership_id=None,
         else:
             # check if corp membership has expired or is renewed
             renewed_corp = corp_membership.get_latest_renewed()
+            renewal_blocked = False # renewal blocked to user
+            corp_expired = False
             if corp_membership.is_expired or (membership.expire_dt >= corp_membership.expiration_dt and not renewed_corp):
-                #display_msg = _("Sorry, we can't process your membership renewal at the moment.")
+                corp_expired = True
+            elif not get_setting('module', 'memberships', 'orgmembercanrenew'):
+                if not (request.user.is_superuser or is_corp_rep):
+                    renewal_blocked = True 
+            
+            #display_msg = _("Sorry, we can't process your membership renewal at the moment.")
+            if renewal_blocked or corp_expired:
                 return render_to_resp(request=request, template_name='memberships/applications/corp_not_renewed.html',
                     context={'app': app,
                        'corp_membership_renew_link': reverse('corpmembership.renew', args=[corp_membership.id]),
                        'corp_membership': corp_membership,
                        'is_rep': is_corp_rep,
-                       'is_admin': request.user.profile.is_superuser})
+                       'is_admin': request.user.is_superuser,
+                       'renewal_blocked': renewal_blocked,
+                       'corp_expired': corp_expired,
+                       'membership': membership})
 
         # check if this corp. has exceeded the maximum number of members allowed if applicable
         apply_cap, membership_cap, allow_above_cap, above_cap_price = corp_membership.get_cap_info()
@@ -1338,7 +1359,7 @@ def membership_default_add(request, slug='', membership_id=None,
                             'country': request_user_profile.country,
                             'work_phone': request_user_profile.work_phone,}
     else:
-        profile_initial = None
+        profile_initial = {}
 
     if join_under_corporate and not is_renewal:
         corp_profile = corp_membership.corp_profile
@@ -2494,6 +2515,17 @@ def report_member_quick_list(request, template_name='reports/membership_quick_li
     """ Table view of current members fname, lname and company only.
     """
     members = MembershipDefault.objects.filter(status=1, status_detail="active").order_by('user__last_name')
+    region_form = None
+    region_name = None
+    region_url_param = ''
+    if members.filter(region__isnull=False).exists():
+        region_form = RegionForm(request.GET)
+        if region_form.is_valid():
+            region = region_form.cleaned_data['region']
+            if region:
+                region_name = region.region_name
+                region_url_param = f'&region={region.id}'
+                members = members.filter(region_id=region.id)
 
     # returns csv response ---------------
     ouput = request.GET.get('output', '')
@@ -2526,7 +2558,12 @@ def report_member_quick_list(request, template_name='reports/membership_quick_li
 
     EventLog.objects.log()
 
-    return render_to_resp(request=request, template_name=template_name, context={'members': members})
+    context={'members': members,
+             'region_form': region_form,
+             'region_name': region_name,
+             'region_url_param': region_url_param}
+    # return render_to_resp(request=request, template_name=template_name, context={'members': members, 'region_id':region_id, 'region_name':region_name, 'region_url_param':region_url_param, 'regions':regions})
+    return render_to_resp(request=request, template_name=template_name, context=context)
 
 
 @staff_member_required

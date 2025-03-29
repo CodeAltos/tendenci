@@ -1,3 +1,50 @@
+### 14.8.2 [2024-2-21]
+
+* Added Region filter option to member_quick_list report. (Thanks to @rob-hills)
+* Updated addons on event registration:  1) Removed the checkbox in front of the addons. 2) Added help text in the addons section. 3) Cleared qty after being processed.
+* Added an itemized list on payonline for event registration.
+* Added the ability to sync credits on event credits edit. 
+* Updated event reminder edit to include QR code in reminder test.
+* Added an option to block renewal for individual members under corp /settings/module/memberships/#id_orgmembercanrenew.
+* linked "Join Zoom Meeting" in registration confirmation email and updated launching zoom meeting to redirect to event view if meeting is not ready or already over.  
+* Fixed a format issue on directories search 
+* iCal update: 1) Resolved an issue that made "Add to calendar" act as “meeting update” in outlook. 2) Ensured lines of text are less than 75 octets https://icalendar.org/iCalendar-RFC-5545/3-1-content-lines.html
+* Fixed pages search not working for tags
+* Fixed an issue for event view that the RSVP button doesn't show for non-member users, even though they are in the selected group(s) for a pricing.
+* Fixed an issue that the default selected addons can't be deleted.
+* Selected addons now show on registration review page. 
+* Resolved code scanning alerts
+* Other miscellaneous fixes
+
+### 14.8.1 [2023-12-24]
+
+* New feature: Event assets purchase for the past events.
+* Updated registration for the nested events to allow users to register for less dates.
+* Fixed the issue about creator and owner not being able to search their own news items.
+* Fixed a bug in invoices search that didn't take account into blank email address.
+* Resolved an issue about forms not being redirected to payment.
+* Other small fixes. 
+ 
+
+### 14.8 [2023-12-10]
+
+**New Features and Improvements**
+
+* ** Event Cancellation and Refund:** 1) Added the ability to charge a cancellation fee when an event registration is cancelled.  2) Added the refund capability to either automatically or manually refund when users cancel their registrations. Currently this feature is only available with Stripe payment. To enable it, you can turn on the setting "Allow refunds" https://www.example.com/settings/module/events/#id_allow_refunds
+* **Nested Events:** Nested events functionality allows you to host events with sessions or sub-events. To enable the nested events, turn on the setting "Enable Nested Events" https://www.example.com/settings/module/events/#id_nested_events.
+* Added an option to not allow users who already registered to register an event again https://www.example.com/settings/module/events/#id_canregisteragain
+* More new features in events: Attendants can earn credits and be granted with certificates. QR code and badges can be used for digital check-in. Zoom integration, etc... 
+* Added the "Register A User" functionality for admin to easily search and register a user for an event.
+* Updated Stripe Connect onboarding process https://tendenci.readthedocs.io/en/latest/topic-guides/payments.html#how-to-use-stripe-connect.
+* Updated custom forms to allow users to specify the quantity of the item(s) purchased. 
+
+**Backward Incompatible**
+
+* Dropped Python 3.6 support. 
+
+**More updates and bugfixes**
+
+
 ### 14.5.1 [2023-07-04]
 
 * Fixed an issue about reps could be removed from dues reps and member reps groups when they're removed from a corp but still associated with other corps.

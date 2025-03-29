@@ -3,7 +3,7 @@
 {% load perm_tags %}
 {% load styled_forms %}
 
-{% block title %}{{ block.super }}{% trans "Add" %}{% endblock %}
+{% block title %}{{ block.super }}{% trans "Email to Event Registrants" %}{% endblock %}
 
 {% block extra_head %}
 {{ block.super }}
@@ -42,6 +42,7 @@
             <div class="message-item">
                 <p><strong>{{ form.body.label }}:</strong></p>
                 {{ form.body }}
+                <span class="help-block">{{ form.body.help_text|safe }}</span>
             </div>
 
             <div class="message-item">

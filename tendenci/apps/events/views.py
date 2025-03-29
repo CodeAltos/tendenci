@@ -134,7 +134,8 @@ from tendenci.apps.events.forms import (
     EventSimpleSearchForm,
     EventReportFilterForm,
     GratuityForm,
-    management_forms_tampered)
+    management_forms_tampered,
+    AssetsPurchaseForm)
 from tendenci.apps.events.utils import (
     email_registrants,
     render_event_email,
@@ -147,6 +148,8 @@ from tendenci.apps.events.utils import (
     get_pricing,
     clean_price,
     get_event_spots_taken,
+    get_calendar_data,
+    get_ics_defaults,
     get_ievent,
     get_vevents,
     copy_event,
@@ -162,7 +165,8 @@ from tendenci.apps.events.utils import (
     get_week_days,
     get_next_month,
     get_prev_month,
-    iter_child_event_registrants)
+    iter_child_event_registrants,
+    replace_qr_code)
 from tendenci.apps.events.addons.forms import RegAddonForm
 from tendenci.apps.events.addons.formsets import RegAddonBaseFormSet
 from tendenci.apps.events.addons.utils import get_available_addons
@@ -228,6 +232,20 @@ def zoom(request, event_id, template_name="events/zoom.html"):
     # If the user is not a registrant of this event or not paid, don't connect to Zoom
     if not registrant or registrant.reg8n_status() == 'payment-required':
         raise Http403
+
+    if not event.zoom_integration_setup:
+        raise Http404
+
+    now = datetime.now()
+    not_ready_yet = event.start_dt - now > timedelta(minutes=10)
+    meeting_is_over = now > event.end_dt
+    if not_ready_yet or meeting_is_over:
+        if not_ready_yet:
+            msg_string = _('Zoom meeting is not available yet, please try later.')
+        elif meeting_is_over:
+            msg_string = _('Zoom meeting is over.')
+        messages.add_message(request, messages.WARNING, msg_string)
+        return HttpResponseRedirect(reverse('event', args=[event.pk]))
 
     return render_to_resp(request=request, template_name=template_name, context={
         'event': event,
@@ -533,49 +551,32 @@ def templates_list(request, template_name="events/templates_list.html"):
         'events': events,
         })
 
-
 def icalendar(request):
-    p = re.compile(r'http(s)?://(www.)?([^/]+)')
-    d = {}
-    file_name = ''
     ics_str = ''
-
-    d['site_url'] = get_setting('site', 'global', 'siteurl')
-    match = p.search(d['site_url'])
-    if match:
-        d['domain_name'] = match.group(3)
-    else:
-        d['domain_name'] = ""
+    existing_file_name = ''
+    file_name, d = get_calendar_data()
 
     if request.user.is_authenticated:
-        file_name = 'ics-%s.ics' % (request.user.pk)
+        existing_file_name = 'ics-%s.ics' % (request.user.pk)
 
     absolute_directory = os.path.join(settings.MEDIA_ROOT, 'files/ics')
     if not os.path.exists(absolute_directory):
         os.makedirs(absolute_directory)
 
-    if file_name:
-        file_path = os.path.join(absolute_directory, file_name)
+    if existing_file_name:
+        file_path = os.path.join(absolute_directory, existing_file_name)
         # Check if ics file exists
         if os.path.isfile(file_path):
             ics = open(file_path, 'r+')
             ics_str = ics.read()
             ics.close()
     if not ics_str:
-        ics_str = "BEGIN:VCALENDAR\r\n"  
-        ics_str += "PRODID:-//Tendenci - The Open Source AMS for Associations//Tendenci 12 MIMEDIR//EN\r\n"
-        ics_str += "VERSION:2.0\r\n"
-        ics_str += "METHOD:PUBLISH\r\n"
-
+        ics_str = get_ics_defaults()
         ics_str += get_vevents(request.user, d)
-
         ics_str += "END:VCALENDAR\r\n"
+
     response = HttpResponse(ics_str)
     response['Content-Type'] = 'text/calendar'
-    if d['domain_name']:
-        file_name = '%s.ics' % (d['domain_name'])
-    else:
-        file_name = "event.ics"
     response['Content-Disposition'] = 'attachment; filename="%s"' % (file_name)
     return response
 
@@ -583,36 +584,20 @@ def icalendar(request):
 def icalendar_single(request, id, guid=''):
     reg8n_guid = guid
     reg8n_id = request.GET.get('reg8n_id')
-    
-    p = re.compile(r'http(s)?://(www.)?([^/]+)')
-    d = {'reg8n_guid': reg8n_guid,
-         'reg8n_id': reg8n_id}
+    file_name, d = get_calendar_data()
+
+    d.update({'reg8n_guid': reg8n_guid,
+              'reg8n_id': reg8n_id})
 
     if not Event.objects.filter(pk=id).exists():
         raise Http404
 
-    d['site_url'] = get_setting('site', 'global', 'siteurl')
-    match = p.search(d['site_url'])
-    if match:
-        d['domain_name'] = match.group(3)
-    else:
-        d['domain_name'] = ""
-
-    ics_str = "BEGIN:VCALENDAR\r\n"
-    ics_str += "PRODID:-//Tendenci - The Open Source AMS for Associations//Tendenci Codebase 12 MIMEDIR//EN\r\n"
-    ics_str += "VERSION:2.0\r\n"
-    ics_str += "METHOD:PUBLISH\r\n"
-
+    ics_str = get_ics_defaults()
     ics_str += get_ievent(request.user, d, id)
-
     ics_str += "END:VCALENDAR\r\n"
 
     response = HttpResponse(ics_str)
     response['Content-Type'] = 'text/calendar'
-    if d['domain_name']:
-        file_name = '%s.ics' % (d['domain_name'])
-    else:
-        file_name = "event.ics"
     response['Content-Disposition'] = 'attachment; filename="%s"' % (file_name)
     return response
 
@@ -854,6 +839,10 @@ def credits_edit(request, id, form_class=EventCreditForm, template_name="events/
                 messages.set_level(request, messages.ERROR)
                 messages.add_message(request, messages.ERROR, e.args[0])
                 redirect_url = 'event.credits_edit'
+
+        sync_credits = request.POST.get('sync_credits', False)
+        if sync_credits:
+            event.sync_credits()
 
         msg_string = 'Successfully updated %s' % str(event)
         messages.add_message(request, messages.SUCCESS, _(msg_string))
@@ -2169,6 +2158,86 @@ def member_register(request, event_id, form_class=MemberRegistrationForm,
         'for_member': for_member
     })
 
+@is_enabled('events')
+@login_required
+def purchase_assets(request, event_id, form_class=AssetsPurchaseForm,
+                    template_name="events/reg8n/purchase-assets.html"):
+    """
+    Event assets purchase.
+    """
+    event = get_object_or_404(Event, pk=event_id)
+    if event.parent:
+        # this is a child event
+        raise Http404
+
+    reg_conf = event.registration_configuration
+
+    # check if event allows assets purchase
+    if not event.is_over:
+        # event not over yet, 
+        if reg_conf and reg_conf.enabled:
+            msg_string = _(f'Registration is still open. You can register for the event {event.title}')
+        else:
+            msg_string = _('Event is not over yet')
+        messages.add_message(request, messages.INFO, msg_string)
+        return HttpResponseRedirect(reverse('event', args=[event_id]))
+
+    if not reg_conf.available_for_purchase:
+        msg_string = _('No assets are available for purchasing for this event.')
+        messages.add_message(request, messages.INFO, msg_string)
+        return HttpResponseRedirect(reverse('event', args=[event_id]))
+
+    pricings = reg_conf.get_assets_purchase_available_pricings(request.user)
+    pricings = pricings.filter(quantity=1)
+    if pricings.count() == 0:
+        msg_string = f'No pricing is available for event {event.title}'
+        messages.add_message(request, messages.ERROR, _(msg_string))
+
+    initial = {}
+    if not request.user.is_superuser:
+        initial = {'first_name':request.user.first_name,
+                    'last_name':request.user.last_name,
+                    'email':request.user.email,}
+        if hasattr(request.user, 'profile'):
+            profile = request.user.profile
+            initial.update({'phone': profile.phone})
+    form = form_class(event, pricings, request.POST or None,
+                      request_user=request.user, initial=initial)
+
+    if request.method == "POST":
+        if form.is_valid():
+            assets_purchaser = form.save(commit=False)
+            # find user record
+            if assets_purchaser.email.lower() == request.user.email.lower():
+                assets_purchaser.user = request.user
+            else:
+                user = User.objects.filter(email__iexact=assets_purchaser.email).first()
+                if user:
+                    assets_purchaser.user = user
+            assets_purchaser.event = event
+            assets_purchaser.amount = assets_purchaser.pricing.price
+            assets_purchaser.save()
+            # create invoice
+            assets_purchaser.save_invoice(request.user)
+            
+            # log an event
+            EventLog.objects.log(instance=assets_purchaser)
+            
+            # redirect to online payment
+            if assets_purchaser.payment_method.machine_name.lower() == 'credit-card' \
+                and assets_purchaser.invoice.balance > 0:
+                return HttpResponseRedirect(reverse('payment.pay_online',
+                                    args=[assets_purchaser.invoice.id,
+                                          assets_purchaser.invoice.guid]))
+            return HttpResponseRedirect(reverse('invoice.view', args=[assets_purchaser.invoice.id]))
+
+    
+    return render_to_resp(request=request, template_name=template_name,
+           context={
+            'event':event,
+            'form': form,
+    })
+
 
 @is_enabled('events')
 @superuser_required
@@ -2218,7 +2287,8 @@ def sessions_list(request, registrant_id, template_name="events/registrants/sess
             'event': event,
             'registrant': registrant,
             'attend_dates': attend_dates,
-            'reg_child_events': reg_child_events
+            'reg_child_events': reg_child_events,
+            'can_edit': request.user.is_superuser or (not event.is_over and not registrant.registration_closed)
         })
 
 
@@ -3298,12 +3368,17 @@ def registration_edit(request, reg8n_id=0, hash='', template_name="events/reg8n/
             attendance_dates_changed = False
             total_available_days = len(reg8n.event.full_event_days)
             for index, registrant in enumerate(registrants):
-                # Don't updage attendance dates or child events if registration is closed
+                # Don't updage attendance dates or child events if registration is closed (non admin users)
                 # or if nested events is not enabled, or event has no child events
-                if not registrant.can_edit_attendance_dates:
+                can_edit_attendance_dates = (
+                    registrant.can_edit_attendance_dates or
+                    (request.user.is_superuser and reg8n.event.can_edit_attendance_dates_admin)
+                )
+                if not can_edit_attendance_dates:
                     continue
 
                 pricing = registrant.pricing
+                
 
                 past_dates = len(registrant.past_attendance_dates)
                 registrants_updated_dates = list()
@@ -3314,14 +3389,15 @@ def registration_edit(request, reg8n_id=0, hash='', template_name="events/reg8n/
                 if request.user.is_superuser:
                     total_attendance_dates = len(registrants_updated_dates)
 
-                if pricing.days_price_covers > total_available_days:
-                    pricing.days_price_covers = total_available_days
-                if pricing and pricing.days_price_covers and total_attendance_dates != pricing.days_price_covers:
-                    message = f'Select { pricing.days_price_covers - past_dates} dates for {registrant.first_name } { registrant.last_name}'
-                    messages.set_level(request, messages.ERROR)
-                    messages.add_message(request, messages.ERROR, _(message))
-                    redirect = False
-                    break
+                if pricing and pricing.days_price_covers:
+                    if pricing.days_price_covers > total_available_days:
+                        pricing.days_price_covers = total_available_days
+                    if total_attendance_dates > pricing.days_price_covers - past_dates:
+                        message = f'Select up to { pricing.days_price_covers - past_dates} dates for {registrant.first_name } { registrant.last_name}'
+                        messages.set_level(request, messages.ERROR)
+                        messages.add_message(request, messages.ERROR, _(message))
+                        redirect = False
+                        break
 
                 original_dates = registrant.attendance_dates if request.user.is_superuser else registrant.upcoming_attendance_dates
                 if registrants_updated_dates != original_dates:
@@ -3388,6 +3464,7 @@ def registration_edit(request, reg8n_id=0, hash='', template_name="events/reg8n/
                                               'formset_errors':formset_errors,
                                               'total_regt_forms':total_regt_forms,
                                               'reg8n': reg8n,
+                                              'is_admin': request.user.is_superuser,
                                               'registrants': registrants
                                                })
 
@@ -3998,6 +4075,7 @@ def registrant_roster(request, event_id=0, roster_view='', template_name='events
 
     sort_order = request.GET.get('sort_order', 'last_name')
     sort_type = request.GET.get('sort_type', 'asc')
+    checked_in_only = request.GET.get('checked_in_only', False)
 
     if sort_order not in ('first_name', 'last_name', 'company_name'):
         sort_order = 'last_name'
@@ -4009,11 +4087,11 @@ def registrant_roster(request, event_id=0, roster_view='', template_name='events
 
     payment_required = event.registration_configuration.payment_required
     if payment_required:
-        # if payment is requird, they don't want to see those not paid
-        roster_view = 'paid'
-    else:
-        if not roster_view:  # default to total page
-            roster_view = 'total'
+        if get_setting('module', 'events', 'roster_paid_only'):
+            # if payment is requird, they don't want to see those not paid
+            roster_view = 'paid'
+    if not roster_view:  # default to total page
+        roster_view = 'total'
 
     # paid or non-paid or total
     registrations = Registration.objects.filter(event=event, canceled=False)
@@ -4068,8 +4146,12 @@ def registrant_roster(request, event_id=0, roster_view='', template_name='events
     if roster_view in ('paid', 'non-paid'):
         registrants = registrants.filter(registration__in=registrations)
 
-    # get the total checked in
-    total_checked_in = registrants.filter(checked_in=True).count()
+    if checked_in_only:
+        registrants = registrants.filter(checked_in=True)
+        total_checked_in = registrants.count()
+    else:
+        # get the total checked in
+        total_checked_in = registrants.filter(checked_in=True).count()
 
     # Pricing title - store with the registrant to improve the performance.
     pricing_titles = RegConfPricing.objects.filter(
@@ -4180,7 +4262,9 @@ def registrant_roster(request, event_id=0, roster_view='', template_name='events
                     registrant.addons_amount = Decimal('0')
                     for addon_item in reg8n_to_addons_list:
                         if addon_item[0] == registrant.registration_id:
-                            registrant.addons += '%s(%s) ' % (addon_item[1], addon_item[2])
+                            registrant.addons += addon_item[1]
+                            if addon_item[2]:
+                                registrant.addons += f'({addon_item[2]})'
                             registrant.addons_amount += addon_item[3]
 
     total_sum = float(0)
@@ -4209,7 +4293,8 @@ def registrant_roster(request, event_id=0, roster_view='', template_name='events
         'discount_available': discount_available,
         'addon_total_sum': addon_total_sum,
         'total_checked_in': total_checked_in,
-        'payment_required': payment_required})
+        'payment_required': payment_required,
+        'checked_in_only': checked_in_only})
 
 
 @is_enabled('events')
@@ -4281,9 +4366,11 @@ def registrant_check_in(request):
         checked_out = request.POST.get('checked_out', None)
         child_event = request.POST.get('child_event', None)
         if registrant_id:
+            registrant_id = int(registrant_id)
             if not child_event:
                 [registrant] = Registrant.objects.filter(id=registrant_id)[:1] or [None]
             else:
+                child_event = int(child_event)
                 registrant = RegistrantChildEvent.objects.filter(pk=child_event).first()
 
             if registrant:
@@ -4293,6 +4380,10 @@ def registrant_check_in(request):
                         registrant.checked_in = True
                         registrant.checked_in_dt = datetime.now()
                         registrant.save()
+                        if child_event:
+                            # nested events don't have checked_out enabled, assign credits now
+                            # the registrant here is an instance of RegistrantChildEvent
+                            registrant.child_event.assign_credits(registrant.registrant)
                     response_d['checked_in_dt'] = registrant.checked_in_dt
                     if isinstance(response_d['checked_in_dt'], datetime):
                         response_d['checked_in_dt'] = response_d['checked_in_dt'].strftime('%m/%d %I:%M%p')
@@ -4413,20 +4504,28 @@ def registrant_badge(request, registrant_id=0, template_name='events/badges.html
 
 @is_enabled('events')
 @login_required
-def sample_certificate(request, event_id=0, template_name='events/registrants/certificate-symposium.html'):
+def sample_certificate(request, event_id=0):
     """Sample certificate for Event"""
     event = get_object_or_404(Event, pk=event_id)
 
     if not request.user.is_superuser or not has_perm(request.user,'events.view_event', event):
         raise Http403
 
-    credits_by_sub_events = {datetime.now().date().strftime('%B %d, %Y'): [{
-        'event_code': event.event_code,
-        'title': event.title,
-        'credits': event.possible_cpe_credits,
-        'irs_credits': 5.0,
-        'alternate_ceu': '123423423487'
-    }]}
+    sub_event_credits = list()
+    credit_event = event # event to use for getting sample credits (single event certificates)
+    for child_event in event.child_events:
+        if child_event.possible_cpe_credits:
+            credit_event = child_event
+            # List of credits by sub-event (symposium certificates)
+            sub_event_credits.append({
+                'event_code': child_event.event_code,
+                'title': child_event.title,
+                'credits': child_event.possible_cpe_credits,
+                'irs_credits': 5.0,
+                'alternate_ceu': '123423423487'
+            })
+
+    credits_by_sub_events = {datetime.now().date().strftime('%B %d, %Y'): sub_event_credits}
 
     registrant = {
         'event': event,
@@ -4435,16 +4534,14 @@ def sample_certificate(request, event_id=0, template_name='events/registrants/ce
         'license_state': 'TX',
         'ptin': 987654321,
         'event_dates_display': event.event_dates_display,
-        'possible_cpe_credits': event.possible_cpe_credits,
-        'credits_earned': event.possible_cpe_credits,
+        'possible_cpe_credits': credit_event.possible_cpe_credits,
+        'credits_earned': credit_event.possible_cpe_credits,
         'irs_credits_earned': 5.0,
         'credits_by_sub_event': credits_by_sub_events,
-        'possible_credits_by_code': event.possible_credits_by_code,
-        'credits_earned_by_code': event.possible_credits_by_code
+        'possible_credits_by_code': credit_event.possible_credits_by_code,
+        'credits_earned_by_code': credit_event.possible_credits_by_code
     }
-    # TODO: remove hard-coded symposiums later
-    if not (event.has_child_events and (event.type and event.type.name.lower() == 'symposiums')):
-        template_name = 'events/registrants/certificate-single-event.html'
+    template_name = event.get_certificate_template()
 
     return render_to_resp(request=request, template_name=template_name,
         context={
@@ -4456,16 +4553,14 @@ def sample_certificate(request, event_id=0, template_name='events/registrants/ce
 
 @is_enabled('events')
 @login_required
-def registrant_certificate(request, registrant_id=0, template_name='events/registrants/certificate-symposium.html'):
+def registrant_certificate(request, registrant_id=0):
     registrant = get_object_or_404(Registrant, pk=registrant_id)
 
     if not has_perm(request.user,'registrants.view_registrant', registrant):
         if not (registrant.user and registrant.user == request.user):
             raise Http403
 
-    # TODO: remove hard-coded symposiums later
-    if not (registrant.event.has_child_events and (registrant.event.type and registrant.event.type.name.lower() == 'symposiums')):
-        template_name = 'events/registrants/certificate-single-event.html'
+    template_name = registrant.event.get_certificate_template()
 
     return render_to_resp(request=request, template_name=template_name,
         context={
@@ -4487,6 +4582,7 @@ def registration_confirmation(request, id=0, reg8n_id=0, hash='',
     event = get_object_or_404(Event, pk=id)
     registrants_count = 1
     registrant_hash = hash
+    is_registrant = False
 
     if reg8n_id:
         registration = get_object_or_404(Registration, event=event, pk=reg8n_id)
@@ -4547,6 +4643,8 @@ def registration_confirmation(request, id=0, reg8n_id=0, hash='',
         'registrants_count': registrants_count,
         'addons': addons,
         'hash': registrant_hash,
+        'is_registrant': is_registrant,
+        'use_badges': settings.USE_BADGES,
         })
 
 
@@ -4648,7 +4746,15 @@ def edit_email(request, event_id, form_class=EmailForm, template_name='events/ed
             messages.add_message(request, messages.SUCCESS, _(msg_string))
 
             if request.POST.get('submit', '') == 'Save & Test':
-                render_event_email(event, email)
+                registrants = None
+                if email.body.find('{{ qr_code }}') != -1:
+                    registrant = Registrant.objects.filter(
+                                    user=request.user,
+                                    registration__event=event).first()
+                    if registrant:
+                        registrants = [registrant]
+                        email.body = replace_qr_code(email.body)
+                email = render_event_email(event, email, registrants=registrants)
                 site_url = get_setting('site', 'global', 'siteurl')
                 email.recipient = request.user.email
                 email.subject = "Reminder: %s" % email.subject
@@ -4871,12 +4977,21 @@ def registrant_export_with_custom(request, event_id, roster_view=''):
 
     # registrants with regular reg form
     non_custom_registrants = registrants.filter(custom_reg_form_entry=None)
-    non_custom_registrants = non_custom_registrants.values('pk', *registrant_lookups)
-
+    non_custom_registrants = non_custom_registrants.values('pk', 'user_id', *registrant_lookups)
     if non_custom_registrants:
         values_list.insert(0, list(registrant_mappings.keys()) + ['is_paid', 'primary_registrant'])
 
         for registrant_dict in non_custom_registrants:
+            if registrant_dict['user_id']:
+                user = User.objects.get(id=registrant_dict['user_id'])
+                if hasattr(user, 'profile'):
+                    profile = user.profile
+                    registrant_dict['address'] = registrant_dict['address'] or profile.address
+                    registrant_dict['city'] = registrant_dict['city'] or profile.city
+                    registrant_dict['state'] = registrant_dict['state'] or profile.state
+                    registrant_dict['zip'] = registrant_dict['zip'] or profile.zipcode
+                    registrant_dict['country'] = registrant_dict['country'] or profile.country
+
 
             is_paid = False
             primary_registrant = u'-- N/A ---'
@@ -4897,6 +5012,7 @@ def registrant_export_with_custom(request, event_id, roster_view=''):
                 registrant_dict['registration__invoice__balance'] = 0
 
             del registrant_dict['pk']
+            del registrant_dict['user_id']
 
             # keeps order of values
             registrant_tuple = RegistrantTuple(**registrant_dict)
@@ -5240,7 +5356,7 @@ def list_addons(request, event_id, template_name="events/addons/list.html"):
 
     return render_to_resp(request=request, template_name=template_name, context={
         'event':event,
-        'addons':event.addon_set.all(),
+        'addons':event.addon_set.all().order_by('position'),
     })
 
 

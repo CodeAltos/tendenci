@@ -334,11 +334,11 @@ class Profile(Person):
         if not self.id:
             self.guid = str(uuid.uuid4())
 
-            # check and assign account id
-            if not self.account_id and self.is_active:
-                if get_setting('module', 'users', 'useaccountid'):
-                    self.account_id = self.get_next_account_id()
-                    self.save()
+        # check and assign account id
+        if not self.account_id and self.is_active:
+            if get_setting('module', 'users', 'useaccountid'):
+                self.account_id = self.get_next_account_id()
+                self.save()
 
         # match allow_anonymous_view with opposite of hide_in_search
         if self.hide_in_search:
@@ -515,7 +515,7 @@ class Profile(Person):
     @property
     def membership(self):
         [membership] = self.user.membershipdefault_set.exclude(
-                    status_detail='archive').order_by('-create_dt')[:1] or [None]
+                    status_detail__in=['archive', 'disapproved']).order_by('-create_dt')[:1] or [None]
         return membership
 
     @property

@@ -92,10 +92,18 @@ class Type(models.Model):
     An event can only be one type
     A type can have multiple events
     """
+    cert_tempt_choices = (
+        ('', ''),
+        ('events/registrants/certificate-symposium.html', 'certificate-symposium.html'),
+        ('events/registrants/certificate-single-event.html', 'certificate-single-event.html',
+    ))
     name = models.CharField(max_length=50)
     slug = models.SlugField(max_length=50, editable=False)
     color_set = models.ForeignKey('TypeColorSet', on_delete=models.CASCADE)
-
+    certificate_template = models.CharField(max_length=100,
+                                            blank=True, default='',
+                                            choices=cert_tempt_choices)
+    
     objects = EventTypeManager()
 
     class Meta:
@@ -567,6 +575,32 @@ class RegistrationConfiguration(models.Model):
 
         return pricings
 
+
+    def get_assets_purchase_available_pricings(self, user):
+        """
+        Get the available pricings for this user.
+        """
+        filter_and, filter_or = RegConfPricing.get_assets_purchase_access_filter(user)
+
+        q_obj = None
+        if filter_and:
+            q_obj = Q(**filter_and)
+        if filter_or:
+            q_obj_or = reduce(operator.or_, [Q(**{key: value}) for key, value in filter_or.items()])
+            if q_obj:
+                q_obj = reduce(operator.and_, [q_obj, q_obj_or])
+            else:
+                q_obj = q_obj_or
+        pricings = RegConfPricing.objects.filter(
+                    reg_conf=self,
+                    status=True,
+                    assets_purchase=True,
+                    )
+        if q_obj:
+            pricings = pricings.filter(q_obj).distinct()
+
+        return pricings
+
     def has_member_price(self):
         """
         Returns [boolean] whether or not this
@@ -575,6 +609,13 @@ class RegistrationConfiguration(models.Model):
         price_set = self.regconfpricing_set.all()
         has_members = [p.allow_member for p in price_set]
         return any(has_members)
+
+    @property
+    def available_for_purchase(self):
+        """
+        Assets available for purchasing.
+        """
+        return self.regconfpricing_set.filter(assets_purchase=True).exists()
 
 
 class RegConfPricing(OrderingBaseModel):
@@ -595,6 +636,7 @@ class RegConfPricing(OrderingBaseModel):
     groups = models.ManyToManyField(Group, blank=True)
     days_price_covers = models.PositiveSmallIntegerField(
         blank=True, null=True, help_text=_("Number of days this price covers (optional)."))
+    assets_purchase = models.BooleanField(_('Pricing available for assets purchase'), default=False)
     price = models.DecimalField(_('Price'), max_digits=21, decimal_places=2, default=0)
     include_tax = models.BooleanField(default=False)
     tax_rate = models.DecimalField(blank=True, max_digits=5, decimal_places=4, default=0,
@@ -765,7 +807,7 @@ class RegConfPricing(OrderingBaseModel):
             filter_or = {'allow_anonymous': True,
                         'allow_user': True,
                         'allow_member': True}
-        if not user.is_anonymous and user.profile.is_member:
+        if not user.is_anonymous and user.group_member.exists():
             # get a list of groups for this user
             groups_id_list = user.group_member.values_list('group__id', flat=True)
             if groups_id_list:
@@ -780,7 +822,33 @@ class RegConfPricing(OrderingBaseModel):
                 filter_and['quantity__lte'] = spots_available
 
         return filter_and, filter_or
-    
+
+    @staticmethod
+    def get_assets_purchase_access_filter(user):
+        if user.profile.is_superuser: return None, None
+        now = datetime.now()
+        filter_and, filter_or = None, None
+
+        if user.is_anonymous:
+            filter_or = {'allow_anonymous': True}
+        elif not user.profile.is_member:
+            filter_or = {'allow_anonymous': True,
+                         'allow_user': True
+                        }
+        else:
+            # user is a member
+            filter_or = {'allow_anonymous': True,
+                         'allow_user': True,
+                         'allow_member': True}
+
+        if not user.is_anonymous and user.profile.is_member:
+            # get a list of groups for this user
+            groups_id_list = user.group_member.values_list('group__id', flat=True)
+            if groups_id_list:
+                filter_or.update({'groups__in': groups_id_list})
+
+        return filter_and, filter_or
+   
     @property
     def tax_amount(self):
         if self.include_tax:
@@ -881,16 +949,27 @@ class Registration(models.Model):
         if not self.event.nested_events_enabled:
             return False
 
+        can_edit = False
         for registrant in self.registrant_set.filter(cancel_dt__isnull=True):
-            return (
+            can_edit = (
                 not registrant.registration_closed and (
                     (registrant.user and registrant.user.profile.is_superuser and
                     registrant.event.child_events.exists()) or
                     registrant.event.upcoming_child_events.exists()
                 )
             )
+            if can_edit:
+                return True
 
         return False
+    
+    @property
+    def can_admin_edit_child_events(self):
+        """If admin user can edit child events, return True"""
+        if not self.event.nested_events_enabled:
+            return False
+
+        return self.event.child_events.exists()
 
     def allow_adjust_invoice_by(self, request_user):
         """
@@ -976,6 +1055,10 @@ class Registration(models.Model):
         """
         Update the object after online payment is received.
         """
+        if self.event.is_over:
+            # event is over, no need to send registration confimation
+            return
+
         try:
             from tendenci.apps.notifications import models as notification
         except:
@@ -1291,6 +1374,32 @@ class Registration(models.Model):
 
         return addons_text
 
+    def send_registrant_notification(self):
+        primary_registrant = self.registrant
+        if primary_registrant and  primary_registrant.email:
+            site_label = get_setting('site', 'global', 'sitedisplayname')
+            site_url = get_setting('site', 'global', 'siteurl')
+            self_reg8n = get_setting('module', 'users', 'selfregistration')
+            registrants = self.registrant_set.filter(cancel_dt=None).order_by('id')
+            notification.send_emails(
+                    [primary_registrant.email],
+                    'event_registration_confirmation',
+                    {
+                        'SITE_GLOBAL_SITEDISPLAYNAME': site_label,
+                        'SITE_GLOBAL_SITEURL': site_url,
+                        'self_reg8n': self_reg8n,
+    
+                        'reg8n': self,
+                        'registrants': registrants,
+    
+                        'event': self.event,
+                        'total_amount': self.invoice.total,
+                        'is_paid': self.invoice.balance == 0,
+                        'reply_to': self.event.registration_configuration.reply_to,
+                    },
+                    True, # save notice in db
+                )
+
 
 class Registrant(models.Model):
     """
@@ -1443,7 +1552,7 @@ class Registrant(models.Model):
             self.event.nested_events_enabled and
             self.event.has_child_events
         )
-
+    
     def sub_event_datetimes(self, is_admin=False):
         """Returns list of start_dt for available sub events"""
         child_events = self.event.child_events if is_admin else self.available_child_events
@@ -1539,7 +1648,7 @@ class Registrant(models.Model):
 
             credits[date].append({
                 'event_code': event.event_code,
-                'title': event.title,
+                'title': event.title if len(event.title) <= 60 else event.short_name,
                 'credits': cpe_credits,
                 'irs_credits': irs_credits,
 
@@ -1710,7 +1819,7 @@ class Registrant(models.Model):
         except:
             raise Exception(error_message)
 
-        if check_in_or_out == 'checked_out' and not self.event.eventcredit_set.available().exists():
+        if check_in_or_out == 'checked_out' and self.event.eventcredit_set.available().exists():
             self.event.assign_credits(self)
 
     def get_name(self):
@@ -1969,6 +2078,162 @@ class Registrant(models.Model):
                                              value=value,
                                              entry=entry,
                                              field=field)
+
+
+class AssetsPurchase(models.Model):
+    """
+    Event assets purchaser.
+    """
+    STATUS_CHOICES = (
+                ('approved', _('Approved')),
+                ('pending', _('Pending')),
+                ('declined', _('Declined')),
+                )
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    event = models.ForeignKey('Event', on_delete=models.CASCADE)
+    amount = models.DecimalField(_('Amount'), max_digits=21, decimal_places=2, blank=True, default=0)
+    pricing = models.ForeignKey('RegConfPricing', null=True, on_delete=models.SET_NULL)
+    invoice = models.ForeignKey(Invoice, blank=True, null=True, on_delete=models.SET_NULL)
+    payment_method = models.ForeignKey(GlobalPaymentMethod, null=True, on_delete=models.SET_NULL)
+
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    phone = models.CharField(max_length=50, blank=True)
+    email = models.CharField(max_length=100)
+
+    create_dt = models.DateTimeField(auto_now_add=True)
+    update_dt = models.DateTimeField(auto_now=True)
+
+    status_detail = models.CharField(_('Status'),
+                                     max_length=20,
+                                     default='pending',
+                                     choices=STATUS_CHOICES)
+
+    objects = RegistrantManager()
+
+    class Meta:
+        app_label = 'events'
+
+    def __str__(self):
+        return f'Assets purchase for the event "{self.event.title}" for {self.user.username}'
+
+    def save_invoice(self, request_user, *args, **kwargs):
+        status_detail = kwargs.get('status_detail', 'tendered')
+
+        object_type = ContentType.objects.get(app_label=self._meta.app_label,
+            model=self._meta.model_name)
+
+        try: # get invoice
+            invoice = Invoice.objects.get(
+                object_type = object_type,
+                object_id = self.pk,
+            )
+        except ObjectDoesNotExist: # else; create invoice
+            # cannot use get_or_create method
+            # because too many fields are required
+            invoice = Invoice()
+            invoice.object_type = object_type
+            invoice.object_id = self.pk
+
+        invoice.bill_to =  self.first_name + ' ' + self.last_name
+        
+        invoice.bill_to_first_name = self.first_name
+        invoice.bill_to_last_name = self.last_name
+        invoice.bill_to_email = self.email
+        invoice.ship_to = invoice.bill_to
+        invoice.ship_to_first_name = self.first_name
+        invoice.ship_to_last_name = self.last_name
+        invoice.ship_to_email = self.email
+        if hasattr(self.user, 'profile'):
+            profile = self.user.profile
+            invoice.bill_to_company = profile.company
+            invoice.bill_to_phone = profile.phone
+            invoice.bill_to_address = profile.address
+            invoice.bill_to_city = profile.city
+            invoice.bill_to_state = profile.state
+            invoice.bill_to_zip_code = profile.zipcode
+            invoice.bill_to_country =  profile.country
+            invoice.ship_to_company = profile.company
+            invoice.ship_to_address = profile.address
+            invoice.ship_to_city = profile.city
+            invoice.ship_to_state = profile.state
+            invoice.ship_to_zip_code =  profile.zipcode
+            invoice.ship_to_country = profile.country
+            invoice.ship_to_phone =  profile.phone
+
+        invoice.creator = request_user
+        invoice.owner = self.user
+
+        # update invoice with details
+        invoice.title = "Assets purchaser %s for Event: %s" % (self.pk, self.event.title)
+        invoice.estimate = ('estimate' == status_detail)
+        invoice.status_detail = status_detail
+        invoice.tender_date = datetime.now()
+        invoice.due_date = datetime.now()
+        invoice.ship_date = datetime.now()
+
+        invoice.subtotal = self.amount
+        invoice.total = invoice.subtotal
+        invoice.balance = invoice.total
+        invoice.save()
+
+        self.invoice = invoice
+
+        self.save()
+
+        return invoice
+
+    def is_paid(self):
+        return self.invoice and self.invoice.balance <= 0
+
+    def email_purchased(self, to_admin=False):
+        """
+        Email to user or admins that event assets purchased.
+        """
+        if self.event.registration_configuration:
+                reply_to = self.event.registration_configuration.reply_to
+        else:
+            reply_to = None
+        site_label = get_setting('site', 'global', 'sitedisplayname')
+        site_url = get_setting('site', 'global', 'siteurl')
+        
+        if to_admin:
+            admins = get_setting('module', 'events', 'admin_emails').split(',')
+            recipients = [admin.strip() for admin in admins if admin.strip()]
+            reg_conf = self.event.registration_configuration
+            if reg_conf.reply_to and reg_conf.reply_to_receive_notices:
+                email_addr = reg_conf.reply_to.strip()
+                if email_addr not in recipients:
+                    recipients.append(email_addr)
+        else:
+            recipients = [self.email]
+
+        if recipients:
+            notification.send_emails(
+                [self.email],  # recipient(s)
+                'event_assets_purchase_confirmation',  # template
+                {
+                    'SITE_GLOBAL_SITEDISPLAYNAME': site_label,
+                    'SITE_GLOBAL_SITEURL': site_url,
+                    'site_label': site_label,
+                    'site_url': site_url,
+                    'assets_purchase': self,
+                    'event': self.event,
+                    'reply_to': reply_to,
+                },
+                True,  # notice saved in db
+            )
+
+    def auto_update_paid_object(self, request, payment):
+        """
+        Update the object after online payment is received.
+        """
+        if self.is_paid:
+            self.status_detail = 'approved'
+            self.save()
+
+            self.email_purchased()
+            self.email_purchased(to_admin=True)
 
 
 class RegistrantChildEvent(models.Model):
@@ -2338,6 +2603,7 @@ class Event(TendenciBaseModel):
     def __init__(self, *args, **kwargs):
         super(Event, self).__init__(*args, **kwargs)
         self.private_slug = self.private_slug or Event.make_slug()
+        self._original_repeat_of = self.repeat_of
 
     @property
     def title_with_event_code(self):
@@ -2367,6 +2633,65 @@ class Event(TendenciBaseModel):
             end_dt__lte=self.end_dt,
         )
 
+    @property
+    def structured_data(self):
+        site_url = get_setting('site', 'global', 'siteurl')
+        url = site_url + self.get_absolute_url()
+        data = {
+          "@context": "https://schema.org",
+          "@type": "Event",
+          "name": self.title,
+          "description": self.description,
+          "startDate": self.start_dt.isoformat(),
+          "endDate": self.end_dt.isoformat(),
+          "eventStatus": "https://schema.org/EventScheduled",
+          }
+        if self.image:
+            data['image'] = site_url + reverse('file', args=[self.image.pk])
+        
+        if self.place:
+            if self.place.virtual:
+                data['eventAttendanceMode'] = "https://schema.org/OnlineEventAttendanceMode"
+                data['location'] = {"@type": "VirtualLocation"}
+                if self.place.url:
+                    data['location']['url'] = self.place.url
+            else:
+                data['eventAttendanceMode'] = "https://schema.org/OfflineEventAttendanceMode"
+                if self.place.name or self.place.address:
+                    data['location'] = {"@type": "Place",}
+                    if self.place.name:
+                        data['location']['name'] = self.place.name
+                    if self.place.address:
+                        data['location']['address'] = {"@type": "PostalAddress",
+                                                       "streetAddress": self.place.address,
+                                                       "addressLocality": self.place.city,
+                                                       "addressRegion": self.place.state,
+                                                       "postalCode": self.place.zip,
+                                                       "addressCountry": self.place.country}
+        pricings = RegConfPricing.objects.filter(
+                    reg_conf=self.registration_configuration,
+                    status=True
+                    ).filter(Q(allow_anonymous=True) | Q(allow_user=True) | Q(allow_member=True))
+        if pricings.count() > 0:
+            offers_list = []
+            for pricing in pricings:
+                offers_list.append({
+                "@type": "Offer",
+                "name": pricing.title,
+                "price": str(pricing.price),
+                "priceCurrency": get_setting("site", "global", "currency"),
+                "validFrom": pricing.start_dt.isoformat(),
+                "url": url,
+              })
+
+            if pricings.count() == 1:
+                data['offers'] = offers_list[0]
+            else:
+                data['offers'] = offers_list
+
+        return data
+        
+
     def sub_event_datetimes(self, child_events=None):
         """Returns list of start_dt for available sub events"""
         datetimes = dict()
@@ -2392,8 +2717,8 @@ class Event(TendenciBaseModel):
                 continue
 
             day = start_dt.date()
-            start_time = start_dt.strftime("%-I:%M %p")
-            end_time = sub_event_datetimes[start_dt].strftime("%-I:%M %p")
+            start_time = start_dt.strftime("%I:%M %p")
+            end_time = sub_event_datetimes[start_dt].strftime("%I:%M %p")
             time_slot = f'{start_time} - {end_time}'
 
             if day not in sub_events_by_datetime:
@@ -2424,6 +2749,15 @@ class Event(TendenciBaseModel):
             start_dt__date__gt=datetime.now().date(),
             registration_configuration__enabled=True
         )
+
+    def get_certificate_template(self):
+        template_name = self.type and self.type.certificate_template
+        if not template_name:
+            if self.has_child_events:
+                template_name='events/registrants/certificate-symposium.html'
+            else:
+                template_name = 'events/registrants/certificate-single-event.html'
+        return template_name
 
     @property
     def events_with_credits(self):
@@ -2906,8 +3240,41 @@ class Event(TendenciBaseModel):
             # If registrant credit was found, but hasn't been released, allow
             # it to update the credit count
             if not r_credit.released and r_credit.credits != credits:
-               r_credit.credits = credits
-               r_credit.save(update_fields=['credits'])
+                r_credit.credits = credits
+                r_credit.save(update_fields=['credits'])
+
+    def sync_credits(self):
+        """
+        Sync credits with the checked-in registrant.
+
+        If a credit is removed from an event, it will be removed
+        from registrant credits as well unless it is already released.
+        """
+        if self.parent: # a child event
+            for c_registrant in RegistrantChildEvent.objects.filter(
+                                    child_event=self,
+                                    checked_in=True):
+                self.assign_credits(c_registrant.registrant)
+        else: # single event
+            for registrant in Registrant.objects.filter(
+                        registration__event=self,
+                        checked_in=True,
+                        checked_out=True,
+                        cancel_dt__isnull=True):
+                reg8n = registrant.registration
+                if reg8n.status() == 'registered':
+                    self.assign_credits(registrant)
+
+        # remove registrant credits that are no longer available for this event
+        # except for those already released
+        available_credit_ids = EventCredit.objects.filter(event=self,
+                                                       available=True
+                                                       ).values_list('id', flat=True)
+        registrant_credits = RegistrantCredits.objects.filter(event=self, released=False)
+        if available_credit_ids:
+            registrant_credits = registrant_credits.exclude(
+                    event_credit_id__in=available_credit_ids)
+        registrant_credits.delete()
 
     def is_registrant(self, user):
         return Registration.objects.filter(event=self, registrant=user).exists()
@@ -2940,7 +3307,18 @@ class Event(TendenciBaseModel):
         # This allows us to identify all repeats, including the original event. 
         # Without this set, we would not identify the original as being the same
         # as a repeated event.
-        self.repeat_uuid = self.repeat_uuid or uuid.uuid4()
+        
+        # Check if repeat_of has been removed or switched to another sub event
+        if self.repeat_of != self._original_repeat_of:
+            if not self.repeat_of:
+                # 1) removed - re-assign a new unique uuid 
+                self.repeat_uuid = uuid.uuid4()
+            else:
+                # 2) switched to another event - find the new repeat_uuid
+                self.repeat_uuid = self.repeat_of.repeat_uuid or uuid.uuid4()
+        else:
+            self.repeat_uuid = self.repeat_uuid or uuid.uuid4()
+
         self.guid = self.guid or str(uuid.uuid4())
 
         super(Event, self).save(*args, **kwargs)
@@ -2952,10 +3330,29 @@ class Event(TendenciBaseModel):
         return f'{self.title} ({self.start_dt.strftime("%m/%d/%Y")} - {self.end_dt.strftime("%m/%d/%Y")})'
 
     @property
+    def can_edit_attendance_dates_admin(self):
+        """
+        Attendance dates are editable by an admin user if
+        nested events are enabled and event has child events
+        """
+        return (
+            self.nested_events_enabled and
+            self.has_child_events
+        )
+    
+    @property
     def has_addons(self):
         return Addon.objects.filter(
             event=self,
             status=True
+            ).exists()
+
+    @property
+    def has_addons_price(self):
+        return Addon.objects.filter(
+            event=self,
+            status=True,
+            price__gt=0
             ).exists()
 
     @property
@@ -3015,6 +3412,10 @@ class Event(TendenciBaseModel):
     @property
     def is_over(self):
         return self.end_dt <= datetime.now()
+
+    @property
+    def available_for_purchase(self):
+        return self.is_over and self.registration_configuration and self.registration_configuration.available_for_purchase
 
     @property
     def money_collected(self):
@@ -3689,7 +4090,7 @@ class CustomRegFieldEntry(models.Model):
     class Meta:
         app_label = 'events'
 
-class Addon(models.Model):
+class Addon(OrderingBaseModel):
     event = models.ForeignKey(Event, on_delete=models.CASCADE)
     title = models.CharField(max_length=50)
 
